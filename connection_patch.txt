@@ -1,0 +1,14 @@
+--- contrib/postgres_fdw/connection.c   2019-02-22 09:31:10.801333555 +0900
++++ contrib/postgres_fdw/connection.c.new   2019-02-22 09:31:04.153283090 +0900
+@@ -429,7 +429,10 @@ begin_remote_xact(ConnCacheEntry *entry)
+        if (IsolationIsSerializable())
+            sql = "START TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+        else
+-           sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
++           if (XactIsoLevel == XACT_READ_COMMITTED)
++               sql = "START TRANSACTION ISOLATION LEVEL READ COMMITTED";
++           else
++               sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+        entry->changing_xact_state = true;
+        do_sql_command(entry->conn, sql);
+        entry->xact_depth = 1;
