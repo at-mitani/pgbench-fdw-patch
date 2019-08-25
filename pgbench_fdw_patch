@@ -1,0 +1,417 @@
+--- pgbench.c	2018-12-06 02:48:21.070900436 +0000
++++ pgbench.c.new	2018-12-06 02:48:14.338772142 +0000
+@@ -121,6 +121,15 @@ int64		end_time = 0;		/* when to stop in
+ int			scale = 1;
+ 
+ /*
++ * setup parameter for table partitioning on FDW
++ * skip_scale: start key value in child table, shoud be less than scale.
++ * parent_config: specified configuration of parent table,  which is 
++ *                include child server's hostname, port, db and user.
++ */
++int		skip_scale = 0;
++char		*parent_config = NULL;
++
++/*
+  * fillfactor. for example, fillfactor = 90 will use only 90 percent
+  * space during inserts and leave 10 percent free.
+  */
+@@ -471,6 +480,15 @@ typedef struct BuiltinScript
+ 	const char *script;			/* actual pgbench script */
+ } BuiltinScript;
+ 
++typedef struct ChildInfo 
++{
++	const char * host;
++	const char * port;
++	const char * db;
++	const char * user;
++	const char * password;
++} ChildInfo;
++
+ static const BuiltinScript builtin_script[] =
+ {
+ 	{
+@@ -526,6 +544,12 @@ static void *threadRun(void *arg);
+ static void setalarm(int seconds);
+ static void finishCon(CState *st);
+ 
++static int initCreateExtension(PGconn *con, char * parent_config);
++static void initCreateForeignTable(PGconn *con);
++static char * getConfigFile(char * fname);
++static ChildInfo ** getChildInfo(char * buf);
++static char * getChildItem(char * buf, char * key);
++
+ 
+ /* callback functions for our flex lexer */
+ static const PsqlScanCallbacks pgbench_callbacks = {
+@@ -548,6 +572,8 @@ usage(void)
+ 		   "  -n, --no-vacuum          do not run VACUUM during initialization\n"
+ 		   "  -q, --quiet              quiet logging (one message each 5 seconds)\n"
+ 		   "  -s, --scale=NUM          scaling factor\n"
++		   "  -w, --start-child-scale=NUM     set start key value in the child table\n"
++		   "  -W, --parent-table-param=CONFIGFILE create parent table with specified configuration\n"
+ 		   "  --foreign-keys           create foreign key constraints between tables\n"
+ 		   "  --index-tablespace=TABLESPACE\n"
+ 		   "                           create indexes in the specified tablespace\n"
+@@ -3515,8 +3541,6 @@ initCreateTables(PGconn *con)
+ 		{
+ 			"pgbench_accounts",
+ 			"aid    int not null,bid int,abalance int,filler char(84)",
+-			"aid bigint not null,bid int,abalance int,filler char(84)",
+-			1
+ 		},
+ 		{
+ 			"pgbench_branches",
+@@ -3528,7 +3552,6 @@ initCreateTables(PGconn *con)
+ 	int			i;
+ 
+ 	fprintf(stderr, "creating tables...\n");
+-
+ 	for (i = 0; i < lengthof(DDLs); i++)
+ 	{
+ 		char		opts[256];
+@@ -3538,7 +3561,16 @@ initCreateTables(PGconn *con)
+ 
+ 		/* Construct new create table statement. */
+ 		opts[0] = '\0';
+-		if (ddl->declare_fillfactor)
++		if ((parent_config != NULL) && (strcmp(ddl->table,"pgbench_history")))
++		{
++			char * s1;
++			char * key;
++			s1 = strdup(ddl->smcols);
++			key = strtok(s1, " ");
++			snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts),
++					 " PARTITION BY RANGE (%s)", key);
++		}
++		else if (ddl->declare_fillfactor)
+ 			snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts),
+ 					 " with (fillfactor=%d)", fillfactor);
+ 		if (tablespace != NULL)
+@@ -3551,7 +3583,6 @@ initCreateTables(PGconn *con)
+ 					 " tablespace %s", escape_tablespace);
+ 			PQfreemem(escape_tablespace);
+ 		}
+-
+ 		cols = (scale >= SCALE_32BIT_THRESHOLD) ? ddl->bigcols : ddl->smcols;
+ 
+ 		snprintf(buffer, sizeof(buffer), "create%s table %s(%s)%s",
+@@ -3562,6 +3593,217 @@ initCreateTables(PGconn *con)
+ 	}
+ }
+ 
++static int
++initCreateExtension(PGconn *con, char * parent_config)
++{
++	int child_num = 0;
++	char buffer[256];
++	ChildInfo ** child_info;
++	ChildInfo * rec;
++	char * user;
++	char * p;
++
++	child_info = getChildInfo(parent_config);	
++	rec = *child_info;
++	if (rec == NULL)
++		return 0;
++	if (login == NULL)
++	{
++		login = getenv("PGUSER");
++	}
++	if (login == NULL)
++	{
++		user = strdup(rec->user);
++		user ++;
++		p = strchr(user, '\'');
++		if (p != NULL)
++		{
++			*p = '\0';
++		}
++		login = user;
++	}
++
++	fprintf(stderr, "creating extensions...\n");
++	snprintf(buffer, sizeof(buffer), "CREATE EXTENSION postgres_fdw");
++	executeStatement(con, buffer);
++	while (rec != NULL)
++	{
++		snprintf(buffer, sizeof(buffer), "CREATE SERVER db%d FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host %s, port %s, dbname %s)",
++			child_num + 1, rec->host, rec->port, rec->db);
++		executeStatement(con, buffer);
++		snprintf(buffer, sizeof(buffer), "CREATE USER MAPPING FOR %s SERVER db%d OPTIONS (user %s, password %s)",
++			login, child_num + 1, rec->user, rec->password);
++		executeStatement(con, buffer);
++		child_num ++;
++		rec = *(child_info + child_num);
++	}
++	return child_num;
++}
++
++static void
++initCreateForeignTable(PGconn *con)
++{
++	struct tableinfo
++	{
++		const char *table;		/* table name */
++		const int num;
++	};
++	static const struct tableinfo Tables[] = {
++		{
++			"pgbench_tellers",
++			ntellers
++		},
++		{
++			"pgbench_accounts",
++			naccounts
++		},
++		{
++			"pgbench_branches",
++			nbranches
++		}
++	};
++	int i;
++	int child_num = 0;
++
++	if (parent_config == NULL)
++	{
++		return;
++	}
++	child_num = initCreateExtension(con, parent_config);
++	
++	fprintf(stderr, "creating %d foreign tables...\n",child_num);
++	for (i = 0; i < lengthof(Tables); i++)
++	{
++		int j;
++		int each;
++		const struct tableinfo *tables = &Tables[i];
++		each = tables->num * scale / (child_num );
++		for (j = 1; j <= child_num; j ++)
++		{
++			char buffer[256];
++			int begin;
++			int end;
++			begin = (j - 1) * each + 1;
++			end = j * each + 1;
++			snprintf(buffer, sizeof(buffer), "CREATE FOREIGN TABLE %s_%d PARTITION OF %s FOR VALUES FROM (%d) TO (%d) SERVER db%d OPTIONS ( table_name '%s')",
++				tables->table, j, tables->table, begin, end, j, tables->table);
++			executeStatement(con, buffer);
++		}
++	}
++}
++
++static char *
++getConfigFile(char * fname)
++{
++	FILE * fd;
++	char * buf;
++	unsigned char c;
++	size_t		buflen = BUFSIZ;
++	size_t		used = 0;
++	size_t		nread = 0;
++
++	if ((fd = fopen(fname, "r")) == NULL)
++	{
++		fprintf(stderr,"could not open file \"%s\":%s\n", fname, strerror(errno));
++		exit(1);
++	}
++	buf = (char *) pg_malloc(buflen);
++	memset(buf, 0, buflen);
++	for (;;)
++	{
++		nread = fread(&c, 1, 1, fd);
++		if (nread <= 0)
++			break;
++		if (c == ' ' || c == '\n' || c == '\t')
++		{
++			continue;
++		}
++		*(buf + used) = c;
++		used += nread;
++	}
++	fclose(fd);
++	return buf;
++}
++
++static ChildInfo **
++getChildInfo(char * fname)
++{
++	int alloc_num;
++	int i = 0;
++	char * buf;
++	char * head;
++	char * host, * port, * db, * user, * password;
++	ChildInfo ** child_info;
++	ChildInfo * p;
++#define COMMANDS_ALLOC_NUM 128
++	alloc_num = COMMANDS_ALLOC_NUM;
++    
++	buf = getConfigFile(fname); 
++	head = buf;
++	child_info = (ChildInfo **) pg_malloc(sizeof(ChildInfo *) * alloc_num);
++	while ((host = getChildItem(head, "host")) != NULL)
++	{
++		if ((port = getChildItem(host + strlen(host) + 1, "port")) == NULL)
++		{
++			fprintf(stderr,"config file format error");
++			exit(1);
++		}
++		if ((db = getChildItem(port + strlen(port) + 1, "db")) == NULL)
++		{
++			fprintf(stderr,"config file format error");
++			exit(1);
++		}
++		if ((user = getChildItem(db + strlen(db) + 1, "user")) == NULL)
++		{
++			fprintf(stderr,"config file format error");
++			exit(1);
++		}
++		if ((password = getChildItem(user + strlen(user) + 1, "password")) == NULL)
++		{
++			fprintf(stderr,"config file format error");
++			exit(1);
++		}
++		head = password + strlen(password) + 1;
++		p = pg_malloc(sizeof(ChildInfo));
++		p->host = strdup(host);
++		p->port = strdup(port);
++		p->db = strdup(db);
++		p->user = strdup(user);
++		p->password = strdup(password);
++		*(child_info + i) = p;
++		i ++;
++	}
++	*(child_info + i) = NULL;
++	free(buf);
++	return child_info;
++
++}
++
++static char *
++getChildItem(char * buf, char * key)
++{
++	char * head;
++	char * body;
++	char * end;
++	if ((head = strstr(buf, key)) == NULL)
++	{
++		return NULL;
++	}
++	if ((end = strchr(head, ':')) == NULL)
++	{
++		fprintf(stderr,"config file format error");
++		exit(1);
++	}
++	body = end + 1;
++	if ((end = strchr(body + 1, '\'')) == NULL)
++	{
++		fprintf(stderr,"config file format error");
++		exit(1);
++	}
++	*(end + 1) = '\0';
++	return body;
++}
++
+ /*
+  * Fill the standard tables with some data
+  */
+@@ -3602,7 +3844,7 @@ initGenerateData(PGconn *con)
+ 	 * fill branches, tellers, accounts in that order in case foreign keys
+ 	 * already exist
+ 	 */
+-	for (i = 0; i < nbranches * scale; i++)
++	for (i = nbranches * skip_scale; i < nbranches * scale; i++)
+ 	{
+ 		/* "filler" column defaults to NULL */
+ 		snprintf(sql, sizeof(sql),
+@@ -3611,7 +3853,7 @@ initGenerateData(PGconn *con)
+ 		executeStatement(con, sql);
+ 	}
+ 
+-	for (i = 0; i < ntellers * scale; i++)
++	for (i = ntellers * skip_scale; i < ntellers * scale; i++)
+ 	{
+ 		/* "filler" column defaults to NULL */
+ 		snprintf(sql, sizeof(sql),
+@@ -3633,7 +3875,7 @@ initGenerateData(PGconn *con)
+ 
+ 	INSTR_TIME_SET_CURRENT(start);
+ 
+-	for (k = 0; k < (int64) naccounts * scale; k++)
++	for (k = (int64) naccounts * skip_scale; k < (int64) naccounts * scale; k++)
+ 	{
+ 		int64		j = k + 1;
+ 
+@@ -3823,13 +4065,15 @@ runInitSteps(const char *initialize_step
+ 				initCreateTables(con);
+ 				break;
+ 			case 'g':
+-				initGenerateData(con);
++				if (parent_config == NULL)
++					initGenerateData(con);
+ 				break;
+ 			case 'v':
+ 				initVacuum(con);
+ 				break;
+ 			case 'p':
+-				initCreatePKeys(con);
++				if (parent_config == NULL)
++					initCreatePKeys(con);
+ 				break;
+ 			case 'f':
+ 				initCreateFKeys(con);
+@@ -3844,6 +4088,10 @@ runInitSteps(const char *initialize_step
+ 		}
+ 	}
+ 
++	if (parent_config != NULL)
++	{
++		initCreateForeignTable(con);
++	}
+ 	fprintf(stderr, "done.\n");
+ 	PQfinish(con);
+ }
+@@ -4582,6 +4830,7 @@ printResults(TState *threads, StatsData
+ 	printf("transaction type: %s\n",
+ 		   num_scripts == 1 ? sql_script[0].desc : "multiple scripts");
+ 	printf("scaling factor: %d\n", scale);
++	printf("start of scaling factor: %d\n", skip_scale);
+ 	printf("query mode: %s\n", QUERYMODE[querymode]);
+ 	printf("number of clients: %d\n", nclients);
+ 	printf("number of threads: %d\n", nthreads);
+@@ -4777,6 +5026,8 @@ main(int argc, char **argv)
+ 		{"report-latencies", no_argument, NULL, 'r'},
+ 		{"rate", required_argument, NULL, 'R'},
+ 		{"scale", required_argument, NULL, 's'},
++		{"skip_scale", required_argument, NULL, 'w'},
++		{"initialize as FDW", required_argument, NULL, 'W'},
+ 		{"select-only", no_argument, NULL, 'S'},
+ 		{"skip-some-updates", no_argument, NULL, 'N'},
+ 		{"time", required_argument, NULL, 'T'},
+@@ -4868,7 +5119,7 @@ main(int argc, char **argv)
+ 		exit(1);
+ 	}
+ 
+-	while ((c = getopt_long(argc, argv, "iI:h:nvp:dqb:SNc:j:Crs:t:T:U:lf:D:F:M:P:R:L:", long_options, &optindex)) != -1)
++	while ((c = getopt_long(argc, argv, "iI:h:nvp:dqb:SNc:j:Crs:w:W:t:T:U:lf:D:F:M:P:R:L:", long_options, &optindex)) != -1)
+ 	{
+ 		char	   *script;
+ 
+@@ -4962,6 +5213,17 @@ main(int argc, char **argv)
+ 					exit(1);
+ 				}
+ 				break;
++			case 'w':
++				skip_scale = atoi(optarg);
++				if (skip_scale <= 0)
++				{
++					fprintf(stderr, "invalid skip scaling factor: \"%s\"\n", optarg);
++					exit(1);
++				}
++				break;
++			case 'W':
++				parent_config = pg_strdup(optarg);
++				break;
+ 			case 't':
+ 				benchmarking_option_set = true;
+ 				nxacts = atoi(optarg);
